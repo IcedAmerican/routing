@@ -1,131 +1,211 @@
 """
 FISCO-BCOS 轻节点客户端封装
-通过 FISCO Python SDK (python_sdk) 与全节点通信，完成合约调用
+
+架构说明:
+  ┌─────────────────────────────────┐
+  │     routing 容器                │
+  │  ┌───────────┐  ┌────────────┐ │
+  │  │ RPC Server│──│FiscoClient │ │
+  │  │ (Flask)   │  │(本模块)     │ │
+  │  └───────────┘  └─────┬──────┘ │
+  │                       │JSON-RPC│
+  │               ┌───────▼──────┐ │
+  │               │ fisco-bcos   │ │
+  │               │ (轻节点进程)  │ │
+  │               └───────┬──────┘ │
+  └───────────────────────┼────────┘
+                          │P2P
+                  ┌───────▼──────┐
+                  │ 全节点网络    │
+                  │ (手动部署)    │
+                  └──────────────┘
+
+FiscoClient 通过本地轻节点 JSON-RPC (127.0.0.1:20200) 交互,
+轻节点负责与全节点的 P2P 通信、区块同步等底层工作。
 """
 import json
 import os
 import time
 import logging
+import subprocess
 from typing import Optional
 
-from eth_utils import to_checksum_address
+import requests
 
 logger = logging.getLogger(__name__)
 
-# 合约 ABI (编译后提取)
-BLACKLIST_ABI = json.loads('''[
-    {
-        "inputs": [{"internalType": "uint256", "name": "_threshold", "type": "uint256"}],
-        "stateMutability": "nonpayable",
-        "type": "constructor"
-    },
+# 黑名单合约 ABI
+BLACKLIST_ABI = [
     {
         "inputs": [
-            {"internalType": "string", "name": "_nodeId", "type": "string"},
-            {"internalType": "string", "name": "_reason", "type": "string"}
+            {"name": "_nodeId", "type": "string"},
+            {"name": "_reason", "type": "string"}
         ],
         "name": "accuse",
         "outputs": [],
-        "stateMutability": "nonpayable",
         "type": "function"
     },
     {
-        "inputs": [{"internalType": "string", "name": "_nodeId", "type": "string"}],
+        "inputs": [{"name": "_nodeId", "type": "string"}],
         "name": "queryStatus",
-        "outputs": [{"internalType": "string", "name": "status", "type": "string"}],
-        "stateMutability": "view",
+        "outputs": [{"name": "status", "type": "string"}],
         "type": "function"
     },
     {
-        "inputs": [{"internalType": "string", "name": "_nodeId", "type": "string"}],
+        "inputs": [{"name": "_nodeId", "type": "string"}],
         "name": "getAccusationCount",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [{"internalType": "string", "name": "_nodeId", "type": "string"}],
-        "name": "unblock",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"internalType": "uint256", "name": "_newThreshold", "type": "uint256"}],
-        "name": "setThreshold",
-        "outputs": [],
-        "stateMutability": "nonpayable",
+        "outputs": [{"name": "", "type": "uint256"}],
         "type": "function"
     },
     {
         "inputs": [],
         "name": "threshold",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
+        "outputs": [{"name": "", "type": "uint256"}],
         "type": "function"
-    }
-]''')
+    },
+]
+
+# 函数签名 -> selector (keccak256 前 4 字节)
+# 预计算避免运行时依赖
+FUNC_SELECTORS = {
+    "accuse(string,string)":        "0xd1574845",
+    "queryStatus(string)":          "0x3e9bb640",
+    "getAccusationCount(string)":   "0x8f601f66",
+    "threshold()":                  "0x42cde4e8",
+}
+
+
+def _encode_string_param(s: str) -> str:
+    """ABI 编码一个 string 参数 (简化版)"""
+    s_bytes = s.encode("utf-8")
+    # offset (32 bytes) + length (32 bytes) + data (padded to 32)
+    data_padded_len = ((len(s_bytes) + 31) // 32) * 32
+    offset = 32  # 一个参数时 offset=0x20
+    length = len(s_bytes)
+    result = offset.to_bytes(32, "big").hex()
+    result += length.to_bytes(32, "big").hex()
+    result += s_bytes.hex().ljust(data_padded_len * 2, "0")
+    return result
+
+
+def _encode_two_strings(s1: str, s2: str) -> str:
+    """ABI 编码两个 string 参数"""
+    s1_bytes = s1.encode("utf-8")
+    s2_bytes = s2.encode("utf-8")
+
+    s1_padded = ((len(s1_bytes) + 31) // 32) * 32
+    s2_padded = ((len(s2_bytes) + 31) // 32) * 32
+
+    # 两个 offset (各 32 bytes)
+    # s1 数据从 offset=64 开始
+    s1_offset = 64
+    # s2 数据从 s1 结束后开始
+    s2_offset = s1_offset + 32 + s1_padded  # 32 for length field
+
+    result = s1_offset.to_bytes(32, "big").hex()
+    result += s2_offset.to_bytes(32, "big").hex()
+    # s1
+    result += len(s1_bytes).to_bytes(32, "big").hex()
+    result += s1_bytes.hex().ljust(s1_padded * 2, "0")
+    # s2
+    result += len(s2_bytes).to_bytes(32, "big").hex()
+    result += s2_bytes.hex().ljust(s2_padded * 2, "0")
+    return result
 
 
 class FiscoClient:
     """
-    封装 FISCO-BCOS 轻节点与全节点的通信逻辑。
-    使用 FISCO Python SDK 的 BcosClient 进行合约交互。
+    通过本地 FISCO-BCOS 轻节点 JSON-RPC 接口交互。
+
+    轻节点进程由 entrypoint.py 在容器启动时拉起, 监听 127.0.0.1:20200。
+    本客户端发 JSON-RPC 请求给轻节点, 轻节点再通过 P2P 与全节点通信。
     """
 
-    def __init__(self, channel_host: str, channel_port: int, group_id: int,
-                 contract_address: str, key_file: str = None):
+    def __init__(self, light_node_rpc: str = "http://127.0.0.1:20200",
+                 group_id: int = 1, contract_address: str = ""):
         """
-        :param channel_host: 全节点 channel 通信地址
-        :param channel_port: 全节点 channel 端口
+        :param light_node_rpc: 本地轻节点 JSON-RPC 地址
         :param group_id: FISCO group ID
-        :param contract_address: 黑名单合约部署地址
-        :param key_file: 客户端私钥文件路径
+        :param contract_address: 黑名单合约地址
         """
-        self.channel_host = channel_host
-        self.channel_port = channel_port
+        self.rpc_url = light_node_rpc
         self.group_id = group_id
         self.contract_address = contract_address
-        self.key_file = key_file or "/app/config/accounts/node_key.pem"
-        self.client = None
+        self._connected = False
+        self._rpc_id = 0
+        self._fisco_process_pid = None
+
+    def _next_id(self) -> int:
+        self._rpc_id += 1
+        return self._rpc_id
+
+    def _rpc_call(self, method: str, params: list, timeout: float = 30.0) -> dict:
+        """发送 JSON-RPC 请求到本地轻节点"""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": self._next_id()
+        }
+        resp = requests.post(self.rpc_url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def connect(self, max_retries: int = 10, retry_interval: float = 3.0):
+        """
+        检测本地轻节点是否已就绪 (JSON-RPC 可达)
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = self._rpc_call("getClientVersion", [self.group_id])
+                if "result" in result:
+                    version_info = result["result"]
+                    logger.info(f"connected to local light node: {version_info}")
+                    self._connected = True
+
+                    # 记录轻节点进程 PID (用于 metrics)
+                    self._find_fisco_pid()
+                    return
+                elif "error" in result:
+                    logger.warning(f"attempt {attempt}: RPC error: {result['error']}")
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"attempt {attempt}/{max_retries}: light node not reachable yet")
+            except Exception as e:
+                logger.warning(f"attempt {attempt}/{max_retries}: {e}")
+
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+
+        logger.error("failed to connect to local light node, falling back to mock mode")
         self._connected = False
 
-    def connect(self, max_retries: int = 5, retry_interval: float = 3.0):
-        """
-        建立与 FISCO 全节点的连接，支持重试。
-        """
+    def _find_fisco_pid(self):
+        """查找 fisco-bcos 进程的 PID"""
         try:
-            from client.bcosclient import BcosClient
-            from client.datatype_parser import DatatypeParser
-
-            # 配置 FISCO SDK client_config.py 通过环境变量覆盖
-            os.environ.setdefault("BCOS_CHANNEL_HOST", self.channel_host)
-            os.environ.setdefault("BCOS_CHANNEL_PORT", str(self.channel_port))
-            os.environ.setdefault("BCOS_GROUP_ID", str(self.group_id))
-
-            for attempt in range(1, max_retries + 1):
-                try:
-                    self.client = BcosClient()
-                    info = self.client.getNodeVersion()
-                    logger.info(f"connected to FISCO node: {info}")
-                    self._connected = True
-                    return
-                except Exception as e:
-                    logger.warning(f"connection attempt {attempt}/{max_retries} failed: {e}")
-                    if attempt < max_retries:
-                        time.sleep(retry_interval)
-            logger.error("failed to connect to FISCO full node after retries")
-        except ImportError:
-            logger.warning("FISCO Python SDK not available, running in mock mode")
-            self._connected = False
+            result = subprocess.run(
+                ["pgrep", "-f", "fisco-bcos"],
+                capture_output=True, text=True, timeout=5
+            )
+            pids = result.stdout.strip().split("\n")
+            if pids and pids[0]:
+                self._fisco_process_pid = int(pids[0])
+                logger.info(f"fisco-bcos process PID: {self._fisco_process_pid}")
+        except Exception:
+            pass
 
     def is_connected(self) -> bool:
         return self._connected
 
+    def get_fisco_pid(self) -> Optional[int]:
+        return self._fisco_process_pid
+
+    # ==================== 合约交互 ====================
+
     def accuse(self, node_id: str, reason: str) -> dict:
         """
-        向黑名单合约提交指控交易
-        :return: {"tx_hash": str, "block_number": int, "latency_ms": float}
+        写入操作: 向链上黑名单合约提交指控交易
+
+        通过轻节点 sendRawTransaction -> 全节点共识打包 -> 返回回执
         """
         start = time.time()
 
@@ -133,19 +213,36 @@ class FiscoClient:
             return self._mock_accuse(node_id, reason, start)
 
         try:
-            receipt = self.client.sendRawTransactionGetReceipt(
-                to_address=self.contract_address,
-                contract_abi=BLACKLIST_ABI,
-                fn_name="accuse",
-                args=[node_id, reason]
-            )
+            # 编码交易数据: accuse(string,string)
+            selector = FUNC_SELECTORS["accuse(string,string)"]
+            encoded_params = _encode_two_strings(node_id, reason)
+            data = selector + encoded_params
+
+            # 通过轻节点 JSON-RPC 发送交易
+            result = self._rpc_call("sendRawTransaction", [
+                self.group_id,
+                {
+                    "to": self.contract_address,
+                    "data": data,
+                }
+            ])
+
             latency_ms = (time.time() - start) * 1000
-            return {
-                "tx_hash": receipt.get("transactionHash", ""),
-                "block_number": int(receipt.get("blockNumber", "0x0"), 16),
-                "status": "success" if receipt.get("status") == "0x0" else "failed",
-                "latency_ms": round(latency_ms, 2)
-            }
+
+            if "result" in result:
+                tx_result = result["result"]
+                return {
+                    "tx_hash": tx_result if isinstance(tx_result, str) else tx_result.get("transactionHash", ""),
+                    "block_number": tx_result.get("blockNumber", 0) if isinstance(tx_result, dict) else 0,
+                    "status": "success",
+                    "latency_ms": round(latency_ms, 2)
+                }
+            else:
+                return {
+                    "error": result.get("error", {}).get("message", str(result)),
+                    "status": "failed",
+                    "latency_ms": round(latency_ms, 2)
+                }
         except Exception as e:
             latency_ms = (time.time() - start) * 1000
             logger.error(f"accuse transaction failed: {e}")
@@ -153,8 +250,9 @@ class FiscoClient:
 
     def query_status(self, node_id: str) -> dict:
         """
-        查询目标节点是否在黑名单中
-        :return: {"node_id": str, "status": "ACTIVE"|"BLOCKED", "latency_ms": float}
+        读取操作: 查询目标节点是否在链上黑名单中
+
+        通过轻节点 call (只读, 不上链) 查询合约状态
         """
         start = time.time()
 
@@ -162,47 +260,107 @@ class FiscoClient:
             return self._mock_query(node_id, start)
 
         try:
-            result = self.client.call(
-                to_address=self.contract_address,
-                contract_abi=BLACKLIST_ABI,
-                fn_name="queryStatus",
-                args=[node_id]
-            )
+            # 编码调用数据: queryStatus(string)
+            selector = FUNC_SELECTORS["queryStatus(string)"]
+            encoded_params = _encode_string_param(node_id)
+            data = selector + encoded_params
+
+            result = self._rpc_call("call", [
+                self.group_id,
+                {
+                    "to": self.contract_address,
+                    "data": data,
+                }
+            ])
+
             latency_ms = (time.time() - start) * 1000
-            status = result[0] if isinstance(result, (list, tuple)) else str(result)
-            return {
-                "node_id": node_id,
-                "status": status,
-                "latency_ms": round(latency_ms, 2)
-            }
+
+            if "result" in result:
+                output = result["result"]
+                # 解码返回的 string
+                status = self._decode_string_output(output)
+                return {
+                    "node_id": node_id,
+                    "status": status,
+                    "latency_ms": round(latency_ms, 2)
+                }
+            else:
+                return {
+                    "node_id": node_id,
+                    "error": result.get("error", {}).get("message", str(result)),
+                    "latency_ms": round(latency_ms, 2)
+                }
         except Exception as e:
             latency_ms = (time.time() - start) * 1000
             logger.error(f"query status failed: {e}")
             return {"node_id": node_id, "error": str(e), "latency_ms": round(latency_ms, 2)}
 
     def get_block_number(self) -> Optional[int]:
-        """获取当前区块高度，用于同步延迟测量"""
+        """获取轻节点当前已同步的区块高度"""
         if not self._connected:
             return None
         try:
-            return self.client.getBlockNumber()
+            result = self._rpc_call("getBlockNumber", [self.group_id])
+            if "result" in result:
+                bn = result["result"]
+                return int(bn, 16) if isinstance(bn, str) and bn.startswith("0x") else int(bn)
+            return None
         except Exception as e:
             logger.error(f"getBlockNumber failed: {e}")
             return None
 
-    def close(self):
-        if self.client:
-            try:
-                self.client.finish()
-            except Exception:
-                pass
+    def get_sync_status(self) -> Optional[dict]:
+        """获取轻节点同步状态"""
+        if not self._connected:
+            return None
+        try:
+            result = self._rpc_call("getSyncStatus", [self.group_id])
+            return result.get("result")
+        except Exception as e:
+            logger.error(f"getSyncStatus failed: {e}")
+            return None
 
-    # ---------- mock methods for testing without FISCO ----------
+    def get_peers(self) -> Optional[list]:
+        """获取轻节点已连接的对端节点信息"""
+        if not self._connected:
+            return None
+        try:
+            result = self._rpc_call("getPeers", [self.group_id])
+            return result.get("result")
+        except Exception as e:
+            logger.error(f"getPeers failed: {e}")
+            return None
+
+    def close(self):
+        """清理资源"""
+        pass
+
+    # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _decode_string_output(hex_output) -> str:
+        """从 ABI 编码的 hex 输出中解码 string"""
+        if isinstance(hex_output, dict):
+            hex_output = hex_output.get("output", "")
+        if not hex_output or hex_output == "0x":
+            return "ACTIVE"
+        try:
+            raw = hex_output.replace("0x", "")
+            if len(raw) < 128:
+                return "ACTIVE"
+            # offset(32) + length(32) + data
+            length = int(raw[64:128], 16)
+            data_hex = raw[128:128 + length * 2]
+            return bytes.fromhex(data_hex).decode("utf-8")
+        except Exception:
+            return "ACTIVE"
+
+    # ==================== Mock 模式 ====================
 
     _mock_blacklist = set()
 
     def _mock_accuse(self, node_id: str, reason: str, start: float) -> dict:
-        self._mock_blacklist.add(node_id)
+        FiscoClient._mock_blacklist.add(node_id)
         latency_ms = (time.time() - start) * 1000
         logger.info(f"[MOCK] accuse {node_id}: {reason}")
         return {
@@ -213,7 +371,7 @@ class FiscoClient:
         }
 
     def _mock_query(self, node_id: str, start: float) -> dict:
-        status = "BLOCKED" if node_id in self._mock_blacklist else "ACTIVE"
+        status = "BLOCKED" if node_id in FiscoClient._mock_blacklist else "ACTIVE"
         latency_ms = (time.time() - start) * 1000
         logger.info(f"[MOCK] query {node_id} => {status}")
         return {
